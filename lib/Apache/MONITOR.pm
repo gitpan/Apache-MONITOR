@@ -4,6 +4,7 @@ require 5.005_62;
 use strict;
 use vars qw($VERSION @EXPORTER @ISA);
 use warnings;
+use String::CRC::Cksum qw(cksum);
 
 use DB_File;
 
@@ -13,23 +14,47 @@ use AutoLoader qw(AUTOLOAD);
 our @ISA = qw(Exporter);
 
 our @EXPORT = qw(SUBSCRIBE UNSUBSCRIBE NOTIFY SHOW);
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 
 use URI::Escape;
 use Apache::Constants qw(:common :http :response :methods);
+use constant SUBSCRIBE_OK => 1;
+use constant SUBSCRIBE_ALREADY => 2;
+use constant SUBSCRIBE_ERROR => 3;
 
+my $original_handler;
 
-
+sub is_proxy_request
+{
+	my $r = shift;
+	my $host = $r->header_in('Host');
+	return 0 unless(  $host );
+	return ($r->server->server_hostname ne $host);
+}
 
 sub handler {
         my $r = shift;
-        #$is_monitor = 0;
         $r->warn( "prr_handler 1");
+	$r->warn( "------------------------------------------" );
+        $r->warn( $r->the_request() );
+        my $href = $r->headers_in();
+        foreach (keys %$href)
+        {
+                $r->warn( "$_ -> $href->{$_}\n");
+        }
+        $r->warn( "------------------------------------------" );
+        $r->warn( $r->server->server_hostname );
+        $r->warn( $r->get_server_name );
+	if( is_proxy_request($r) )
+        {
+		$r->warn( "IS PROXYREQ");
+        }
         return DECLINED unless $r->method() eq 'MONITOR' ;
+        $r->warn( "Filename " , $r->filename, "\n" );
+        $r->warn( "Uri " , $r->uri, "\n" );
+        $r->warn( "pathinfop " , $r->path_info, "\n" );
         $r->warn( "prr_handler 2");
  
-        #$is_monitor = 1;
-        #$r->method('GET');
         $r->method_number(M_GET);
  
         return OK;
@@ -37,70 +62,50 @@ sub handler {
 
 sub hp_handler {
         my $r = shift;
-	$r->warn( "handler 1");
+	$r->warn( "hp handler 1");
+	
+	$r->set_handlers(PerlFixupHandler => undef);
         return DECLINED unless $r->method() eq 'MONITOR' ;
-        #return DECLINED unless $is_monitor;
 	$r->warn( "hp handler 2");
- 
-	#$r->method('MONITOR');
-	#$r->method_number(M_INVALID);
+
+	$original_handler = $r->handler();
  
         $r->handler("perl-script");
-        $r->push_handlers(PerlHandler => \&monitor_handler);
+        $r->set_handlers(PerlHandler => [ \&monitor_handler ] );
+        $r->warn( "Filename " , $r->filename, "\n" );
+        $r->warn( "Uri " , $r->uri, "\n" );
+        $r->warn( "pathinfop " , $r->path_info, "\n" );
 	$r->warn( "hp handler 3");
+
+	if( $r->proxyreq() )
+        {
+		$r->warn( "IS PROXYREQ");
+                $r->filename('');
+        }
+
+	$r->set_handlers(PerlAccessHandler => undef);
+	$r->set_handlers(PerlAuthenHandler => undef);
+	$r->set_handlers(PerlDispatchHandler => undef);
+	$r->set_handlers(PerlTypeHandler => undef);
+	$r->set_handlers(PerlFixupHandler => [ \&fixup ]);
  
         return OK;
 }
 
- 
-sub add_subscription
+sub fixup
 {
-        my ($r,$uri,$filename,$reply_to) = @_;
+	my $r = shift;
+	$r->warn( "FIXUP1: handler is now " . $r->handler());
 
-        my $dir = $r->dir_config('MonitorDataDir');
-        my $mon_prefix = $r->dir_config('MonitorUrlPrefix');
+        $r->handler("perl-script");
+        $r->set_handlers(PerlHandler => [ \&monitor_handler ] );
+	$r->warn( "FIXUP2: handler is now " . $r->handler());
 
-	my $monitor_url = $mon_prefix; 
-	my %uris;
-	my %monitors;
+	$r->set_handlers(PerlFixupHandler => undef);
 
-
-	open(LOCK,">$dir/lock") || die("unable to open $dir/lock, $!");
-	flock(LOCK,2);	
-
-	dbmopen( %uris , "$dir/uris", 0666) || die("unable to open $dir/uris, $!");	
-	if(! exists $uris{$uri})
-	{
-		my $now = time();
-		my $value = join(' ', ($uri,$filename,$now) );
-		$uris{$uri} = $value;
-	}
-	dbmclose(%uris);
-
-	dbmopen( %monitors , "$dir/monitors", 0666) || die("unable to open $dir/monitors, $!");	
-	foreach my $muri (keys %monitors)
-	{
-		my $value = $monitors{$muri};
-		my ($u,$re) = split (/ /,$value);
-		if( ($u eq $uri) && ($re eq $reply_to) )
-		{
-			
-			dbmclose(%monitors);
-			close(LOCK);
-			$r->warn("$u already monitored to ($re)");
-			die("$u already monitored to ($re)");
-			return $muri;
-		}
-	}
-	my $id = time() . $$;	
-	$monitor_url .= $id;
-	$monitors{$monitor_url} = "$uri $reply_to";
-	dbmclose(%monitors);
-	close(LOCK);
-
-
-	return $monitor_url;
+	return OK;
 }
+
  
  
  
@@ -108,39 +113,106 @@ sub monitor_handler
 {
         my $r = shift;
 
-	if( ! is_monitorable($r,$r->filename) )
-	{
-		return HTTP_METHOD_NOT_ALLOWED;
-	}
-
- 
-        my $reply_uri = $r->header_in( 'Reply-To' );
-	$r->warn( "monitor_handler 3");
- 
-        if( !defined $reply_uri || !$reply_uri)
-        {
-                return BAD_REQUEST;
-        }
+	my $state = 'NONE';
 
 	my $host = $r->header_in( 'Host' );
         if( !defined $host || !$host)
         {
+		#FIXME allow HTTP 1.0!
+                return BAD_REQUEST;
+        }
+
+	my $monitored_uri = $r->uri;
+	if($r->uri !~ /:\/\//)
+	{
+		$monitored_uri = "http://$host" . $r->uri;
+	}
+	$r->warn( "monitored URI:  $monitored_uri");
+
+	my $mon_string = "";
+	if( is_proxy_request($r) )
+	{
+		$mon_string = "proxy:" . $monitored_uri;
+		my($cs,$rv,$msg) = poll_to_checksum($monitored_uri);
+		$state = $cs;
+		if($rv)
+		{
+			$r->warn( "error when polling remote resource: $msg");
+		}
+	}
+	else
+	{	
+		my $monitor_code = get_monitor_code($r,$monitored_uri);
+		$r->warn( "monitor_code: " . ( $monitor_code ? $monitor_code : "undef" ));
+
+		if( (!$monitor_code) && (  ($r->filename =~ /cgi/) || (! -f $r->filename)) )
+		{
+			$r->warn( "monitor_handler HTTP_METHOD_NOT_ALLOWED");
+			return HTTP_METHOD_NOT_ALLOWED;
+		}
+		if( $monitor_code )
+		{
+			$mon_string = "apply:" . $monitor_code;
+		}
+		else
+		{
+			$mon_string = "mtime:" . $r->filename;
+		}
+
+	}
+ 
+	$r->warn( "monitor_handler 3 , monstring=$mon_string");
+        my $reply_uri = $r->header_in( 'Reply-To' );
+ 
+        if( !defined $reply_uri || !$reply_uri)
+        {
+		$r->warn( "--------BAD REQUEST -------------" );
+		$r->warn( $r->method );
+		$r->warn( $r->method_number );
+		$r->warn( "--------BAD REQUEST -------------" );
                 return BAD_REQUEST;
         }
 
  
-        my $mon_url = add_subscription($r,"http://$host" . $r->uri,$r->filename,$reply_uri);
+        my ($mon_url,$rv) = add_subscription($r,$monitored_uri,$mon_string,$state,$reply_uri);
+	if($rv == SUBSCRIBE_ERROR)
+	{
+		return SERVER_ERROR;
+	}
  
-        $r->header_out("Location" => $mon_url );
-	$r->status(201);
+	if( 
+	   ($r->header_in('Accept') =~ /text\/html/)
+	|| ($r->header_in('Accept') =~ /\*\/\*/)
 
-        #$r->header_out("Content-Length" => 0);
- 
-        $r->send_http_header();
- 
-        $r->warn( "Filename " , $r->filename, "\n" );
-        $r->warn( "Uri " , $r->uri, "\n" );
-        $r->warn( "pathinfop " , $r->path_info, "\n" );
+	 )
+	{
+		my $msg = ($rv == SUBSCRIBE_OK) ? "You have been subscribed to the URL"
+						: "You are already subscribed to the URL";
+		$r->status(200);
+        	$r->send_http_header("text/html");
+		
+		$r->print(qq{
+		<html>
+		<title>Subscribed</title>
+		<body>
+		$msg
+		<a href="$monitored_uri">$monitored_uri</a>
+		<br />
+		<br />
+		To edit or remove your subscription, visit the
+		<a href="$mon_url">monitor page</a>
+		</body>
+		</html>
+		});
+	}
+	else
+	{
+		$r->header_out('Content-type' => undef);
+		$r->header_out('Content-Type' => undef);
+        	$r->header_out("Location" => $mon_url );
+		$r->status(201);
+        	$r->send_http_header();
+	}
  
         return OK;
 }
@@ -184,7 +256,9 @@ sub moo
 	</head>
 	<body>
 	
-	<h1>Monitor $mon_uri</h1>
+	<p>
+	<b>Monitor $mon_uri</b>
+	</p>
 
 	<p>Monitors: <a href="$u">$u</a><br />
 	Reply-To: <a href="$re">$re</a>
@@ -211,10 +285,11 @@ sub moo
 	}
 	elsif($r->method eq "POST")
 	{
-	my %params = $r->content;
-	if( exists($params{method}) && $params{method} eq "DELETE")
+		my %params = $r->content;
+		return HTTP_METHOD_NOT_ALLOWED;
+	}
+	elsif($r->method eq "DELETE")
 	{
-
 	my %uris;
 	my %monitors;
 	my $uri_still_monitored = 0;
@@ -264,26 +339,116 @@ sub moo
 	</html>
 	});
 
-        return OK;
 	}
-	}
+
         return OK;
+}
+
+sub show_monitors
+{
+	my $r = shift;
+	my %uris;
+	my %monitors;
+	my $dir = $r->dir_config('MonitorDataDir');
+        my $host = $r->header_in( 'Host' );
+        my $mon_uri = 'http://' . $host . $r->uri();
+
+        $r->send_http_header("text/html" );
+	$r->print( qq{
+	<html>
+	<head>
+	<title>Monitors</title>
+	</head>
+	<body>
+	});
+	
+
+
+	open(LOCK,">$dir/lock") || die("unable to open $dir/lock, $!");
+	flock(LOCK,1);	
+
+	dbmopen( %uris , "$dir/uris" , 0040) || die("unable to open $dir/uris, $!");	
+	dbmopen( %monitors , "$dir/monitors" , 0040) || die("unable to open $dir/monitors, $!");	
+	foreach my $uri ( keys %uris)
+	{
+		my $value = $uris{$uri};
+		my ($u,$mon_string,$t,$state) = split(/ /,$value);
+		$r->print(qq{<p><a href="$u">$u</a><br />\n});
+		foreach my $muri (keys %monitors)
+		{
+			my $value = $monitors{$muri};
+			#print "-- $value --\n";
+			my ($u,$re) = split(/ / , $value);
+			if($u eq $uri)
+			{
+				$r->print(qq{
+				&nbsp;&nbsp;&nbsp;<a href="$muri">$muri</a>&nbsp;
+				($re)  [$mon_string]<br />\n});	
+			}
+		}
+		$r->print("</p>\n");
+	}
+	dbmclose(%uris);
+	dbmclose(%monitors);
+
+	close(LOCK);
 }
  
 
-sub is_monitorable
+sub add_subscription
 {
-	my ($r,$filename) = @_;
-	if(-f $filename)
+        my ($r,$uri,$mon_string,$state,$reply_to) = @_;
+
+        my $dir = $r->dir_config('MonitorDataDir');
+        my $mon_prefix = $r->dir_config('MonitorUrlPrefix');
+
+	my $monitor_url = $mon_prefix; 
+	my %uris;
+	my %monitors;
+
+
+	open(LOCK,">$dir/lock") || die("unable to open $dir/lock, $!");
+	flock(LOCK,2);	
+
+	dbmopen( %uris , "$dir/uris", 0666) || die("unable to open $dir/uris, $!");	
+	if(! exists $uris{$uri})
 	{
-		return 1;
+		my $now = time();
+		my $value = join(' ', ($uri,$mon_string,$now,$state) );
+		$uris{$uri} = $value;
 	}
+	dbmclose(%uris);
 
-	return 0;
-	
+	dbmopen( %monitors , "$dir/monitors", 0666) || die("unable to open $dir/monitors, $!");	
+	foreach my $muri (keys %monitors)
+	{
+		my $value = $monitors{$muri};
+		my ($u,$re) = split (/ /,$value);
+		if( ($u eq $uri) && ($re eq $reply_to) )
+		{
+			
+			dbmclose(%monitors);
+			close(LOCK);
+			return ($muri,SUBSCRIBE_ALREADY);
+		}
+	}
+	my $id = time() . $$;	
+	$monitor_url .= $id;
+	$monitors{$monitor_url} = "$uri $reply_to";
+	dbmclose(%monitors);
+	close(LOCK);
+
+
+	return ($monitor_url,SUBSCRIBE_OK);
 }
+ 
 
-
+sub get_monitor_code
+{
+	my ($r,$monitored_uri) = @_;
+	return undef;
+	return "checker";
+}
 
 
 
@@ -298,16 +463,17 @@ sub SUBSCRIBE
 	
 	my $args = @_ ? \@_ : \@ARGV;
 
-	my ($url,$reply_to) = @$args;
+	my ($url,$reply_to,$proxy) = @$args;
+	$ua->proxy(['http'], $proxy ) if(defined $proxy);
 	my $req = HTTP::Request->new('MONITOR' => $url );
 
 	$req->header('Reply_To' => $reply_to );
+	#$req->header('Accept' => 'text/plain' );
 	my $res = $ua->request($req);
 
 	if($res->is_success)
 	{
-		#print $res->as_string();
-		#print $res->content;
+		print $res->as_string();
 		print "Monitor created at: ",$res->header('Location') , "\n";
 	}
 	else
@@ -360,22 +526,55 @@ sub NOTIFY
 
 	dbmopen( %uris , "$dir/uris" , 0040) || die("unable to open $dir/uris, $!");	
 	dbmopen( %monitors , "$dir/monitors" , 0040) || die("unable to open $dir/monitors, $!");	
-	foreach my $monitored_uri ( keys %uris)
+	foreach my $monitored_uri ( keys %uris )
 	{
 		my $value = $uris{$monitored_uri};
-		my ($u,$filename,$lastmod) = split(/ /,$value);
-		#print "--$u $filename $lastmod\n";
+		my ($u,$mon_string,$lastmod,$state) = split(/ /,$value);
+		my $modified_time = $lastmod;
+		#print "--$u $mon_string $lastmod\n";
+		print "*--------------------------------------------------\n";
 
-		my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,
-                      $atime,$mtime,$ctime,$blksize,$blocks) = stat($filename);		
+		if( $mon_string =~ /^apply:(.+)$/ )
+		{
+			# apply code
+			my $code = $1; 
+			require "/tmp/" . $code;
+			$modified_time = $code->check($u);
+		}
+		elsif( $mon_string =~ /^mtime:(.+)$/ )
+		{	
+			my $filename = $1;	
+			print "$monitored_uri: checking file mtime of $filename\n";	
+			my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,
+                     	 $atime,$mtime,$ctime,$blksize,$blocks) = stat($filename);
+			$modified_time = $mtime;
+		}
+		else
+		{
+			my $old_checksum = $state;
+			print "$monitored_uri: checking checksum via HTTP GET\n";	
+			my ($checksum,$rv,$msg) = poll_to_checksum($monitored_uri);
+			if($rv)
+			{
+				print "$monitored_uri: ",$msg, "\n";
+				next;
+			}
+			print " ....old checksum $old_checksum\n";
+			print " ....new checksum $checksum\n";
+			if( $checksum != $old_checksum)
+			{
+				$modified_time = time();
+				$state = $checksum;
+			}
+		}
 	
-		print "checking mtime of $monitored_uri\n";	
-		next unless ($mtime > $lastmod);	
+		next unless ($modified_time > $lastmod);	
 
 		print "...$monitored_uri has changed, getting monitors\n";
 
 		# updating record with new lastmod
-		$uris{$monitored_uri} = "$u $filename $mtime";
+
+		$uris{$monitored_uri} = "$u $mon_string $modified_time $state";
 
 		foreach my $muri (keys %monitors)
 		{
@@ -400,7 +599,7 @@ sub NOTIFY
 			{
 				my $to = $1;
 				open(MAIL,"|mail $to -s \"Resource $monitored_uri has changed\"");
-				print MAIL "Resource state has changed at ". localtime($mtime) ."\n";
+				print MAIL "Resource state has changed at ". localtime($modified_time) ."\n";
 				print MAIL "View the monitored resource: $monitored_uri\n";
 				print MAIL "Edit your monitor: $muri\n";
 				close(MAIL);
@@ -415,41 +614,28 @@ sub NOTIFY
 	close(LOCK);
 
 }
-
-sub SHOW
+sub poll_to_checksum
 {
+	require LWP::UserAgent;
+	@Apache::MONITOR::ISA = qw(LWP::UserAgent);
+	my $ua = __PACKAGE__->new;
 	my $args = @_ ? \@_ : \@ARGV;
 
-	my ($dir) = @$args;
-	my %uris;
-	my %monitors;
+	my ($uri) = @$args;
 
-	open(LOCK,">$dir/lock") || die("unable to open $dir/lock, $!");
-	flock(LOCK,1);	
-
-	dbmopen( %uris , "$dir/uris" , 0040) || die("unable to open $dir/uris, $!");	
-	dbmopen( %monitors , "$dir/monitors" , 0040) || die("unable to open $dir/monitors, $!");	
-	foreach my $uri ( keys %uris)
+	my $req = HTTP::Request->new('GET' => $uri);
+	my $res = $ua->request($req);
+	if($res->is_success)
 	{
-		my $value = $uris{$uri};
-		my ($u,$filename,$t) = split(/ /,$value);
-		print "$u $filename $t\n";
-		foreach my $muri (keys %monitors)
-		{
-			my $value = $monitors{$muri};
-			#print "-- $value --\n";
-			my ($u,$re) = split(/ / , $value);
-			if($u eq $uri)
-			{
-				print "     $muri ($re)\n";	
-			}
-		}
-		
+		my $s = $res->content;
+		$s =~ s/<meta[^>]+>//gi;
+		my $cs = cksum($s);
+		return ($cs,0,'');
 	}
-	dbmclose(%uris);
-	dbmclose(%monitors);
-
-	close(LOCK);
+	else
+	{
+		return (0,1,'GET error');
+	}
 }
 
 1;
